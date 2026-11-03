@@ -1,21 +1,22 @@
 {
-  "name": "vconvert",
+  "name": "vconverter",
   "version": "1.0.0",
   "description": "A tool for downloading videos and converting them to audio/video formats using yt-dlp and ffmpeg.",
   "main": "index.js",
+  "bin": { "vconverter": "index.js" },
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/veil111/vconverter.git"
+    "url": "git+https://github.com/veil111/vconvert.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "bugs": {
-    "url": "https://github.com/veil111/vconverter/issues"
+    "url": "https://github.com/veil111/vconvert/issues"
   },
-  "homepage": "https://github.com/veil111/vconverter#readme"
+  "homepage": "https://github.com/veil111/vconvert#readme"
 }
