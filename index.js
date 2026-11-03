@@ -2,17 +2,17 @@
 // vconverter: local terminal app that downloads audio/video with yt-dlp + FFmpeg.
 // Personal use only. No dependencies beyond Node.js, yt-dlp and ffmpeg on PATH.
 
-const { spawnSync } = require('child_process');
+const { execFile } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
-const { loadConfig, saveConfigValue } = require('./lib/config');
+const { loadConfig, saveConfigValue, systemDownloadsDir } = require('./lib/config');
 const F = require('./lib/formats');
 const Y = require('./lib/ytdlp');
-const { checkForUpdate, runUpdate } = require('./lib/update');
+const { latestVersion, isOlder, runUpdate } = require('./lib/update');
 const { pickFolder } = require('./lib/picker');
 const { Prompter } = require('./lib/prompts');
-const { isUrl, isSoundCloud, heightLabel, formatBytes, formatDuration, truncate } = require('./lib/util');
+const { isUrl, heightLabel, formatBytes, formatDuration, truncate } = require('./lib/util');
 
 const BROWSERS = [
   { id: 'firefox', label: 'Firefox', note: 'most reliable' },
@@ -20,27 +20,31 @@ const BROWSERS = [
   { id: 'edge', label: 'Edge', note: 'close Edge completely first' },
   { id: 'brave', label: 'Brave', note: 'close Brave completely first' },
 ];
-const COMMON_HEIGHTS = [2160, 1440, 1080, 720, 480, 360];
+const COMMON_HEIGHTS = [2160, 1440, 1080, 720, 480, 360]; // offered for playlists, whose videos aren't looked up one by one
+const ESTIMATE_TITLE_WIDTH = 60; // characters of each title shown in the size list
+const SUMMARY_TITLE_WIDTH = 70; // characters of each title/link shown in the final summary
 
-function hasTool(cmd, arg) {
-  const r = spawnSync(cmd, [arg], { stdio: 'ignore' });
-  return !r.error && r.status === 0;
-}
+// Runs `cmd arg` and resolves with its output, or null if it isn't installed.
+const versionOf = (cmd, arg) => new Promise((resolve) => {
+  execFile(cmd, [arg], (err, stdout) => resolve(err ? null : stdout.trim()));
+});
 
-function checkTools() {
-  const missing = [];
-  if (!hasTool('yt-dlp', '--version')) missing.push('yt-dlp');
-  if (!hasTool('ffmpeg', '-version')) missing.push('ffmpeg');
+// Checks that yt-dlp and FFmpeg are installed (both at once). Returns yt-dlp's version.
+async function checkTools() {
+  const [ytdlp, ffmpeg] = await Promise.all([versionOf('yt-dlp', '--version'), versionOf('ffmpeg', '-version')]);
+  const missing = [!ytdlp && 'yt-dlp', !ffmpeg && 'ffmpeg'].filter(Boolean);
   if (missing.length) {
     console.error(`Missing: ${missing.join(', ')}`);
     console.error(`Install with: scoop install ${missing.join(' ')}`);
     process.exit(1);
   }
+  return ytdlp;
 }
 
 function itemTitle(item) {
   const { info } = item;
   if (item.isPlaylist) return `${info.title} (set/playlist, ${(info.entries || []).length} items)`;
+  if (item.names) return item.names.file; // TikTok: the cleaned-up name its files will get
   return `${info.title} (${info.uploader || info.channel || 'unknown'})`;
 }
 
@@ -51,6 +55,17 @@ function clearLine() {
 
 const wants = (opts) => ({ audio: ['audio', 'both'].includes(opts.mode), video: ['video', 'both'].includes(opts.mode) });
 const sum = (list) => list.reduce((a, b) => a + b, 0);
+
+// Which sites are in the queue. `site` is 'tiktok' or 'soundcloud' (see item.site in lib/ytdlp.js).
+const allOn = (items, site) => items.every((i) => i.site === site);
+const anyOn = (items, site) => items.some((i) => i.site === site);
+
+// Starts a site-only question with "For TikTok links: " when the queue also has other sites.
+const SITE_NAMES = { tiktok: 'TikTok', soundcloud: 'SoundCloud' };
+const forLinks = (items, site) => (allOn(items, site) ? '' : `For ${SITE_NAMES[site]} links: `);
+
+// A format's note in the menus: its TikTok-specific note when the whole queue is TikTok.
+const formatNote = (f, items) => (allOn(items, 'tiktok') && f.tiktokNote ? f.tiktokNote : f.note);
 
 // "about 19.8 MB (MP3 9.6 MB + MP4 10.2 MB)". Sizes of 0 are unknown.
 function describeSizes(sizes, opts) {
@@ -68,7 +83,7 @@ function printEstimate(items, opts) {
     return;
   }
   console.log('\nEstimated sizes:');
-  items.forEach((item, i) => console.log(`  ${i + 1}. ${truncate(itemTitle(item), 60)}: ${describeSizes(perItem[i], opts)}`));
+  items.forEach((item, i) => console.log(`  ${i + 1}. ${truncate(itemTitle(item), ESTIMATE_TITLE_WIDTH)}: ${describeSizes(perItem[i], opts)}`));
   const known = perItem.flatMap((s) => Object.values(s));
   const total = sum(known);
   const unknown = known.some((n) => !n);
@@ -77,22 +92,17 @@ function printEstimate(items, opts) {
 
 // ---------- Questions ----------
 
-async function offerUpdate(p, reason) {
-  if (reason) console.log(reason);
-  else {
-    process.stdout.write('Checking for yt-dlp updates...');
-    const update = await checkForUpdate();
-    clearLine();
-    if (!update) return false;
-    console.log(`A newer yt-dlp is available (${update.installed} -> ${update.latest}).`);
-    console.log('YouTube and SoundCloud change often, and an old yt-dlp is the most common reason downloads fail.');
-  }
+async function offerUpdate(p, message) {
+  console.log(message);
   const yes = await p.yesNo('Update yt-dlp now?', true);
   return yes ? runUpdate() : false;
 }
 
 function useFolder(dir) {
-  const resolved = path.resolve(dir.replace(/^["']|["']$/g, '').replace(/^~(?=$|[\\/])/, os.homedir()));
+  const cleaned = dir.replace(/^["']|["']$/g, '').replace(/^~(?=$|[\\/])/, os.homedir());
+  // Only full paths, so a stray word doesn't create a folder wherever the terminal happens to be.
+  if (!path.isAbsolute(cleaned)) throw new Error('use a full path, like C:\\Users\\you\\Music');
+  const resolved = path.resolve(cleaned);
   fs.mkdirSync(resolved, { recursive: true });
   return resolved;
 }
@@ -101,8 +111,8 @@ function useFolder(dir) {
 async function askDownloadDir(p, cfg) {
   for (;;) {
     console.log(`Downloads will be saved to: ${cfg.downloadDir}`);
-    const answer = await p.ask('[Enter] Use this folder  [c] Choose a different folder: ');
-    if (answer === null) return null;
+    const answer = await p.ask('[Enter] Use this folder  [c] Choose a different folder  [q] Quit: ');
+    if (answer === null || answer.toLowerCase() === 'q') return null;
     if (!answer) return cfg.downloadDir;
     let chosen = answer;
     if (answer.toLowerCase() === 'c') {
@@ -158,12 +168,12 @@ async function askQueue(p) {
   }
 }
 
-// Offers to use a browser's sign-in for age-restricted videos. Returns a browser id, null to skip,
-// or undefined if input ended.
-async function askCookies(p, session) {
-  console.log('  vconverter can use your browser\'s YouTube sign-in (its cookies) to get it.');
-  console.log('  You need to be signed in to YouTube in that browser. The cookies stay on this computer');
-  console.log('  and are only sent to YouTube.');
+// Offers to use a browser's sign-in for age-restricted videos. `siteName` is e.g. "YouTube".
+// Returns a browser id, null to skip, or undefined if input ended.
+async function askCookies(p, session, siteName) {
+  console.log(`  vconverter can use your browser's ${siteName} sign-in (its cookies) to get it.`);
+  console.log(`  You need to be signed in to ${siteName} in that browser. The cookies stay on this computer`);
+  console.log(`  and are only sent to ${siteName}.`);
   const choice = await p.choose('Use the sign-in from which browser?',
     [...BROWSERS, { id: null, label: 'No thanks, skip this video' }], 0);
   if (choice === undefined) return undefined;
@@ -184,7 +194,7 @@ async function lookUp(urls, session, p) {
   console.log('');
   showChecked();
   // Look everything up in parallel without cookies first; cookies are only used where needed.
-  const results = await Y.fetchAll(urls, null, () => {
+  const results = await Y.fetchAll(urls, () => {
     checked++;
     if (process.stdout.isTTY) showChecked();
   });
@@ -193,15 +203,17 @@ async function lookUp(urls, session, p) {
     const tag = `[${i + 1}/${urls.length}]`;
     let item = results[i];
     if (item.error && ['age', 'bot'].includes(item.error.kind)) {
+      // Lookups that failed have no item.site yet, so work it out from the link.
+      const siteName = SITE_NAMES[Y.siteOf(url)] || 'YouTube';
       console.log(`${tag} ${item.error.message}`);
-      const browser = session.cookies || (await askCookies(p, session));
+      const browser = session.cookies || (await askCookies(p, session, siteName));
       if (browser === undefined) return undefined;
       if (browser) {
         console.log(`${tag} Trying again with your ${BROWSERS.find((b) => b.id === browser)?.label || browser} sign-in...`);
         item = await Y.fetchInfo(url, browser);
         if (item.error?.kind === 'cookies') session.cookies = null; // ask again next time
         if (item.error && ['age', 'bot'].includes(item.error.kind)) {
-          item.error.message = 'Still blocked with your browser\'s sign-in. Make sure you\'re signed in to YouTube there (and for Chrome/Edge, that the browser is fully closed).';
+          item.error.message = `Still blocked with your browser's sign-in. Make sure you're signed in to ${siteName} there (and for Chrome/Edge, that the browser is fully closed).`;
         }
       } else {
         item.error.message += ' Skipped.';
@@ -218,11 +230,24 @@ async function lookUp(urls, session, p) {
   return { items, failed };
 }
 
+// TikTok only: the audio as heard in the video, or TikTok's full sound file. Returns false if input ended.
+async function chooseTikTokSound(p, items, opts) {
+  const choice = await p.choose(`${forLinks(items, 'tiktok')}Which audio?`, [
+    { id: false, label: 'Audio from the video', note: 'exactly what you hear in the TikTok, same length' },
+    { id: true, label: 'Full sound', note: 'TikTok\'s own sound file, often longer (e.g. more of the song); size unknown' },
+  ], opts.tiktokFullSound ? 1 : 0);
+  if (!choice) return false;
+  opts.tiktokFullSound = choice.id;
+  return true;
+}
+
 // Audio format, then MP3 bitrate. Returns false if input ended.
 async function chooseAudio(p, items, opts) {
-  const sizeFor = (af, q) => sum(items.filter((i) => !i.isPlaylist).map((i) => F.audioSize(i.info, af, q))) || undefined;
+  // TikTok's full sound file has no known length, so it's left out of the sizes.
+  const sized = items.filter((i) => !i.isPlaylist && !(opts.tiktokFullSound && i.site === 'tiktok'));
+  const sizeFor = (af, q) => sum(sized.map((i) => F.audioSize(i.info, af, q))) || undefined;
   const af = await p.choose(`Audio format (estimated size${items.length > 1 ? ' for all' : ''}):`,
-    F.AUDIO_FORMATS.map((f) => ({ ...f, size: sizeFor(f, opts.audioQuality) })),
+    F.AUDIO_FORMATS.map((f) => ({ ...f, note: formatNote(f, items), size: sizeFor(f, opts.audioQuality) })),
     Math.max(0, F.AUDIO_FORMATS.findIndex((f) => f.id === opts.audioFormat)));
   if (!af) return false;
   opts.audioFormat = af.id;
@@ -239,16 +264,22 @@ async function chooseAudio(p, items, opts) {
 async function chooseVideo(p, items, opts) {
   const known = items.filter((i) => !i.isPlaylist);
   process.stdout.write('Estimating sizes...');
-  await Promise.all(F.VIDEO_FORMATS.map((f) => Y.loadVideoSizes(known, f)));
+  await Y.loadVideoSizes(known);
   clearLine();
+  // TikTok has no WebM videos, so WebM isn't offered when the queue has TikTok links.
+  const formats = F.VIDEO_FORMATS.filter((f) => !(anyOn(items, 'tiktok') && f.id === 'webm'));
   const vf = await p.choose(`Video format (estimated size at best quality${items.length > 1 ? ', for all' : ''}):`,
-    F.VIDEO_FORMATS.map((f) => ({ ...f, size: sum(known.map((i) => Y.videoSize(i, f, null))) || undefined })),
-    Math.max(0, F.VIDEO_FORMATS.findIndex((f) => f.id === opts.videoFormat)));
+    formats.map((f) => ({
+      ...f,
+      note: formatNote(f, items),
+      size: sum(known.map((i) => Y.videoSize(i, f, null))) || undefined,
+    })),
+    Math.max(0, formats.findIndex((f) => f.id === opts.videoFormat)));
   if (!vf) return false;
   opts.videoFormat = vf.id;
 
-  const videos = known.filter((i) => !isSoundCloud(i.url));
-  let heights = [...new Set(videos.flatMap((i) => F.videoHeights(i.info, vf)))].sort((a, b) => b - a);
+  const videos = known.filter((i) => i.site !== 'soundcloud');
+  let heights = [...new Set(videos.flatMap((i) => Y.videoHeights(i, vf)))].sort((a, b) => b - a);
   const sized = heights.length > 0;
   if (!heights.length && items.some((i) => i.isPlaylist)) heights = COMMON_HEIGHTS;
   if (!heights.length) {
@@ -271,45 +302,59 @@ async function chooseVideo(p, items, opts) {
   return true;
 }
 
-// All options for the queue. Returns options, null if cancelled, or undefined if input ended.
-async function askOptions(p, items, cfg) {
-  const allSoundCloud = items.every((i) => isSoundCloud(i.url));
-  const anySoundCloud = items.some((i) => isSoundCloud(i.url));
-  const what = await p.choose('What do you want to download?', [
-    { id: 'audio', label: 'Audio only' },
-    { id: 'video', label: 'Video' },
-    { id: 'both', label: 'Both audio + video' },
-    { id: 'thumbnail', label: 'Thumbnail only (.jpg)' },
-  ]);
-  if (!what) return undefined;
-  const opts = {
-    mode: what.id, audioFormat: cfg.audioFormat, audioQuality: cfg.audioQuality, videoFormat: cfg.videoFormat,
-    maxHeight: null, keepDetails: true, coverPicture: false, saveThumb: false, saveInfo: false,
-  };
-  if (wants(opts).audio && !(await chooseAudio(p, items, opts))) return undefined;
-  if (wants(opts).video && !(await chooseVideo(p, items, opts))) return undefined;
-  console.log('');
-  if (wants(opts).audio && anySoundCloud) {
-    opts.keepDetails = await p.yesNo(
-      'Keep the original details (title, artist, date, cover art) inside the audio file? "n" = plain file', true);
-    if (opts.keepDetails === null) return undefined;
-  }
-  // WebM is left out: SoundCloud's audio doesn't fit in it well.
-  if (wants(opts).video && anySoundCloud && opts.videoFormat !== 'webm') {
-    opts.coverPicture = await p.yesNo(
-      `${allSoundCloud ? '' : 'For SoundCloud links: '}Show the cover art as the picture in the video file? "n" = video file with sound only`, true);
-    if (opts.coverPicture === null) return undefined;
-  }
-  if (opts.mode !== 'thumbnail') {
-    opts.saveThumb = await p.yesNo('Also save the thumbnail as a .jpg?', false);
-    if (opts.saveThumb === null) return undefined;
-  }
-  if (items.some((i) => !i.isPlaylist)) {
-    opts.saveInfo = await p.yesNo('Also save an info .txt (upload date, uploader, length, size, ...)?', false);
-    if (opts.saveInfo === null) return undefined;
-  }
+// TikTok only: with or without TikTok's watermark. Returns false if input ended.
+async function chooseWatermark(p, items, opts) {
+  const choice = await p.choose(`${forLinks(items, 'tiktok')}Watermark:`, [
+    { id: false, label: 'Without watermark', note: '' },
+    { id: true, label: 'With watermark',
+      note: 'why lol' },
+  ], opts.watermark ? 1 : 0);
+  if (!choice) return false;
+  opts.watermark = choice.id;
+  return true;
+}
 
-  // Show the estimate and let the user change things until they're happy with it.
+// All the audio questions: TikTok's "which audio?", then format and bitrate. Returns false if input ended.
+async function askAudioChoices(p, items, opts) {
+  if (anyOn(items, 'tiktok') && !(await chooseTikTokSound(p, items, opts))) return false;
+  return chooseAudio(p, items, opts);
+}
+
+// All the video questions: format and quality, then TikTok's watermark. Returns false if input ended.
+async function askVideoChoices(p, items, opts) {
+  if (!(await chooseVideo(p, items, opts))) return false;
+  if (anyOn(items, 'tiktok')) return chooseWatermark(p, items, opts);
+  return true;
+}
+
+// Asks a yes/no question and saves the answer as opts[key]. Returns false if input ended.
+async function askYesNoInto(p, opts, key, question, defaultYes) {
+  const answer = await p.yesNo(question, defaultYes);
+  if (answer === null) return false;
+  opts[key] = answer;
+  return true;
+}
+
+// The yes/no extras: details inside the audio, SoundCloud cover picture, thumbnail .jpg, info .txt.
+// Returns false if input ended.
+async function askExtras(p, items, opts) {
+  if (wants(opts).audio && !(await askYesNoInto(p, opts, 'keepDetails',
+    'Put the thumbnail and details (title, artist, date) inside the audio file? "n" = plain audio file only', true))) return false;
+  // WebM is left out: SoundCloud's audio doesn't fit in it well.
+  if (wants(opts).video && anyOn(items, 'soundcloud') && opts.videoFormat !== 'webm' && !(await askYesNoInto(p, opts, 'coverPicture',
+    `${forLinks(items, 'soundcloud')}Show the cover art as the picture in the video file? "n" = video file with sound only`, true))) return false;
+  if (opts.mode !== 'thumbnail' && !(await askYesNoInto(p, opts, 'saveThumb',
+    'Also save the thumbnail as a .jpg?', false))) return false;
+  if (items.some((i) => !i.isPlaylist) && !(await askYesNoInto(p, opts, 'saveInfo',
+    'Also save an info .txt (upload date, uploader, length, size, ...)?', false))) return false;
+  return true;
+}
+
+const START_OVER = 'start over';
+
+// Shows the estimate and lets the user change things until they're happy with it. Returns the
+// options to download with, null if cancelled, START_OVER, or undefined if input ended.
+async function confirmOptions(p, items, opts) {
   for (;;) {
     printEstimate(items, opts);
     const menu = ['[Enter] Download'];
@@ -320,15 +365,37 @@ async function askOptions(p, items, cfg) {
     if (answer === null) return undefined;
     const key = answer.toLowerCase();
     if (key === 'x') return null;
-    if (key === 'o') return askOptions(p, items, cfg);
+    if (key === 'o') return START_OVER;
     if (key === 'v' && wants(opts).video) {
-      if (!(await chooseVideo(p, items, opts))) return undefined;
+      if (!(await askVideoChoices(p, items, opts))) return undefined;
     } else if (key === 'a' && wants(opts).audio) {
-      if (!(await chooseAudio(p, items, opts))) return undefined;
+      if (!(await askAudioChoices(p, items, opts))) return undefined;
     } else if (!key) {
       return opts;
     }
   }
+}
+
+// All options for the queue. Returns options, null if cancelled, or undefined if input ended.
+async function askOptions(p, items, cfg) {
+  const what = await p.choose('What do you want to download?', [
+    { id: 'audio', label: 'Audio only' },
+    { id: 'video', label: 'Video' },
+    { id: 'both', label: 'Both audio + video' },
+    { id: 'thumbnail', label: 'Thumbnail only (.jpg)' },
+  ]);
+  if (!what) return undefined;
+  const opts = {
+    mode: what.id, audioFormat: cfg.audioFormat, audioQuality: cfg.audioQuality, videoFormat: cfg.videoFormat,
+    maxHeight: null, keepDetails: true, coverPicture: false, watermark: false, tiktokFullSound: false,
+    saveThumb: false, saveInfo: false,
+  };
+  if (wants(opts).audio && !(await askAudioChoices(p, items, opts))) return undefined;
+  if (wants(opts).video && !(await askVideoChoices(p, items, opts))) return undefined;
+  console.log('');
+  if (!(await askExtras(p, items, opts))) return undefined;
+  const result = await confirmOptions(p, items, opts);
+  return result === START_OVER ? askOptions(p, items, cfg) : result;
 }
 
 // ---------- Downloading ----------
@@ -357,68 +424,92 @@ function printSummary(results, failedLookups, cfg) {
   console.log(`\nFinished: ${ok.length} of ${total} downloaded${ok.length ? ` to ${cfg.downloadDir}` : ''}.`);
   if (failed.length) {
     console.log('Not downloaded:');
-    for (const f of failed) console.log(`  ✖ ${truncate(f.title, 70)}\n      ${f.error.message}`);
+    for (const f of failed) console.log(`  ✖ ${truncate(f.title, SUMMARY_TITLE_WIDTH)}\n      ${f.error.message}`);
   }
   console.log('');
 }
 
 // ---------- Modes ----------
 
-async function interactive(cfg) {
-  const p = new Prompter();
-  console.log('vconverter - youtube/soundcloud downloader)\n');
-  if (cfg.checkForUpdates) {
-    await offerUpdate(p);
-    if (p.closed) return;
+// After the folder question: if GitHub has a newer yt-dlp, offers to update. The check started at
+// launch, so it's usually finished by now. Returns false if input ended.
+async function offerStartupUpdate(p, ytdlpVersion, latest) {
+  if (!latest) return true;
+  process.stdout.write('Checking for yt-dlp updates...');
+  const newest = await latest;
+  clearLine();
+  if (newest && isOlder(ytdlpVersion, newest)) {
+    console.log('');
+    await offerUpdate(p, `A newer yt-dlp is available (${ytdlpVersion} -> ${newest}).\n` +
+      'YouTube, SoundCloud and TikTok change often, and an old yt-dlp is the most common reason downloads fail.');
+    if (p.closed) return false;
   }
+  return true;
+}
+
+// If some downloads failed because yt-dlp looks out of date, offers to update it and try them again.
+async function offerUpdateAndRetry(p, results, opts, cfg) {
+  const outdated = results.filter((r) => !r.ok && r.error.kind === 'outdated');
+  if (!outdated.length) return;
+  if (!(await offerUpdate(p, 'Some downloads failed in a way that usually means yt-dlp needs an update.'))) return;
+  const retry = await p.yesNo(`Try the ${outdated.length} failed download(s) again?`, true);
+  if (!retry) return;
+  const again = (await Promise.all(outdated.map((r) => Y.fetchInfo(r.item.url, r.item.cookies)))).filter((it) => !it.error);
+  printSummary(await downloadQueue(again, opts, cfg), [], cfg);
+  again.forEach(Y.removeItemFiles);
+}
+
+// One round: ask for links, look them up, ask the options, download. Returns false to quit.
+async function runQueue(p, cfg, session) {
+  console.log('');
+  const urls = await askQueue(p);
+  if (!urls) return false;
+  const looked = await lookUp(urls, session, p);
+  if (!looked) return false;
+  const { items, failed } = looked;
+  if (!items.length) {
+    printSummary([], failed, cfg);
+    return true;
+  }
+  try {
+    const opts = await askOptions(p, items, cfg);
+    if (opts === undefined) return false;
+    if (opts === null) {
+      console.log('Cancelled.');
+      return true;
+    }
+    const results = await downloadQueue(items, opts, cfg);
+    printSummary(results, failed, cfg);
+    await offerUpdateAndRetry(p, results, opts, cfg);
+    return true;
+  } finally {
+    items.forEach(Y.removeItemFiles); // the saved info files aren't needed after this round
+  }
+}
+
+async function interactive(cfg, ytdlpVersion, latest) {
+  const p = new Prompter();
+  console.log('vconverter - youtube/soundcloud/tiktok downloader\n');
+  // The folder question comes first so a slow update check never holds up the start.
   const dir = await askDownloadDir(p, cfg);
   if (!dir) return p.close();
   cfg.downloadDir = dir;
+  if (!(await offerStartupUpdate(p, ytdlpVersion, latest))) return;
   const session = { cookies: cfg.cookiesFromBrowser };
-
-  for (;;) {
-    console.log('');
-    const urls = await askQueue(p);
-    if (!urls) break;
-    const looked = await lookUp(urls, session, p);
-    if (!looked) break;
-    const { items, failed } = looked;
-    const cleanup = () => items.forEach(Y.removeItemFiles);
-    if (!items.length) {
-      printSummary([], failed, cfg);
-      continue;
-    }
-    const opts = await askOptions(p, items, cfg);
-    if (opts === undefined) {
-      cleanup();
-      break;
-    }
-    if (opts === null) {
-      console.log('Cancelled.');
-      cleanup();
-      continue;
-    }
-    let results = await downloadQueue(items, opts, cfg);
-    printSummary(results, failed, cfg);
-
-    const outdated = results.filter((r) => !r.ok && r.error.kind === 'outdated');
-    if (outdated.length && (await offerUpdate(p, 'Some downloads failed in a way that usually means yt-dlp needs an update.'))) {
-      const retry = await p.yesNo(`Try the ${outdated.length} failed download(s) again?`, true);
-      if (retry) {
-        const again = (await Promise.all(outdated.map((r) => Y.fetchInfo(r.item.url, r.item.cookies)))).filter((it) => !it.error);
-        results = await downloadQueue(again, opts, cfg);
-        printSummary(results, [], cfg);
-        again.forEach(Y.removeItemFiles);
-      }
-    }
-    cleanup();
-  }
+  let keepGoing = true;
+  while (keepGoing) keepGoing = await runQueue(p, cfg, session);
   p.close();
 }
 
 async function main() {
-  checkTools();
-  await interactive(loadConfig());
+  const cfg = loadConfig();
+  // The slower startup checks all run at the same time: the GitHub update check (which nothing
+  // waits for until after the first question), the installed tools, and the Windows Downloads
+  // folder (only needed when no folder is saved).
+  const latest = cfg.checkForUpdates ? latestVersion() : null;
+  const [ytdlpVersion, downloadsDir] = await Promise.all([checkTools(), cfg.downloadDir ? null : systemDownloadsDir()]);
+  cfg.downloadDir ??= downloadsDir;
+  await interactive(cfg, ytdlpVersion, latest);
 }
 
 main();
